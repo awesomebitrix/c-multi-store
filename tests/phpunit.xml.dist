@@ -1,0 +1,9 @@
+<phpunit
+        bootstrap="tests/bootstrap.php"
+        colors="true">
+    <testsuites>
+        <testsuite name="MultiStore Test Suit">
+            <directory>tests/php_interface/include/</directory>
+        </testsuite>
+    </testsuites>
+</phpunit>
