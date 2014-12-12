@@ -228,26 +228,63 @@ class CMultiStore
     }
 
     /**
-     * Метод вызывается после добавления заказа. Получает корзину созданного заказа,
-     * проверяет наличие в нем нескольких элементов на разных складах и разбивает заказ
-     * перенося каждый элемент отдельного склада в новый заказ
+     * Метод копирует свойства заказа с ИД $parentOrderID в заказ с ИД $targetOrderID
      *
-     * @param $ID
-     * @param $arFields
-     * @codeCoverageIgnore
+     * @param $parentOrderID
+     * @param $targetOrderID
+     * @return array
      */
-    public function OnSaleComponentOrderOneStepCompleteHandler($ID, $arFields)
+    protected static function copyOrderProps($parentOrderID, $targetOrderID)
     {
-        \CModule::IncludeModule("sale");
-        \CModule::IncludeModule("catalog");
+        $parentOrderID = intval($parentOrderID);
+        $targetOrderID = intval($targetOrderID);
 
-        global $USER;
+        $arOrderProps = Array();
 
-        //получить корзину заказа со свойствами
-        $arBasketItems = array();
+        if($parentOrderID > 0 && $targetOrderID > 0)
+        {
+            //получить свойства которые нужно скопировать
+            $db_props = \CSaleOrderPropsValue::GetList(
+                array("SORT" => "ASC"),
+                array(
+                    "ORDER_ID" => $parentOrderID,
+                ),
+                false,
+                false,
+                array("ORDER_PROPS_ID", "NAME", "VALUE", "CODE")
+            );
+            while ($arProps = $db_props->Fetch())
+            {
+                $arOrderProps[] = $arProps;
+            }
+
+            //скопировать свойства в заказ с ИД $targetOrderID
+            if(count($arOrderProps) > 0)
+            {
+                foreach($arOrderProps as $arProp)
+                {
+                    $arProp["ORDER_ID"] = $targetOrderID;
+
+                    \CSaleOrderPropsValue::Add($arProp);
+                }
+            }
+        }
+
+        return $arOrderProps;
+    }
+
+    /**
+     * Метод получает корзину заказа и возвращает массив с товарами из этой корзины
+     *
+     * @param $orderID
+     * @return array
+     */
+    protected static function getOrderBasketItems($orderID)
+    {
+        $arBasketItems = Array();
         $dbBasketItems = \CSaleBasket::GetList(
             array("NAME" => "ASC", "ID" => "ASC"),
-            array("ORDER_ID" => $ID),
+            array("ORDER_ID" => $orderID),
             false,
             false,
             array("ID", "PRODUCT_ID", "QUANTITY")
@@ -269,11 +306,36 @@ class CMultiStore
             $arBasketItems[] = $arResultBasket;
         }
 
+        return $arBasketItems;
+    }
+
+    /**
+     * Метод вызывается после добавления заказа. Получает корзину созданного заказа,
+     * проверяет наличие в нем нескольких элементов на разных складах и разбивает заказ
+     * перенося каждый элемент отдельного склада в новый заказ
+     *
+     * @param $ID
+     * @param $arFields
+     * @codeCoverageIgnore
+     */
+    public function OnSaleComponentOrderOneStepCompleteHandler($ID, $arFields)
+    {
+        \CModule::IncludeModule("sale");
+        \CModule::IncludeModule("catalog");
+
+        global $USER;
+
+        //получить корзину заказа со свойствами
+        $arBasketItems = self::getOrderBasketItems($ID);
+
+        $newFirstOrderPrice = $arFields["PRICE"];
+
         foreach($arBasketItems as $arBasketItem)
         {
             //проверить наличие складов в товарах
             if(array_key_exists("STORAGE_ID", $arBasketItem["PROPS"]) && $arBasketItem !== end($arBasketItems))
             {
+                //получить цену товара
                 $arPrice = \CCatalogProduct::GetOptimalPrice(
                     $arBasketItem["PRODUCT_ID"],
                     $arBasketItem["QUANTITY"],
@@ -289,22 +351,36 @@ class CMultiStore
                 foreach($arFields as $fieldCode => $fieldVal)
                 {
                     if($fieldCode == "PRICE")
-                        $arNewOrderFields[$fieldCode] = $optimalPrice;
+                        $arNewOrderFields[$fieldCode] = $optimalPrice*$arBasketItem["QUANTITY"];
                     else
                         $arNewOrderFields[$fieldCode] = $fieldVal;
                 }
 
                 //создать новый заказ
-                $ORDER_ID = \CSaleOrder::Add($arNewOrderFields);
-                $ORDER_ID = IntVal($ORDER_ID);
+                $dividedOrderID = \CSaleOrder::Add($arNewOrderFields);
+                $dividedOrderID = IntVal($dividedOrderID);
+
+                //установить привязку к заказу
+                $arOrderLink = array(
+                    "ORDER_ID" => $dividedOrderID,
+                    "ORDER_PROPS_ID" => 20,
+                    "NAME" => "Привязка к заказу",
+                    "CODE" => "ORDER_LINK",
+                    "VALUE" => $ID
+                );
+                \CSaleOrderPropsValue::Add($arOrderLink);
+
+                //скопировать свойства в новый заказ
+                self::copyOrderProps($ID, $dividedOrderID);
 
                 //обновить корзину и добавить в новый заказ
-                \CSaleBasket::Update($arBasketItem["ID"], Array("ORDER_ID" => $ORDER_ID));
+                \CSaleBasket::Update($arBasketItem["ID"], Array("ORDER_ID" => $dividedOrderID));
 
-                //обновить цену старого заказа
-                \CSaleOrder::Update($ID, Array("PRICE" => $arFields["PRICE"]-$optimalPrice));
+                $newFirstOrderPrice = $newFirstOrderPrice - $optimalPrice*$arBasketItem["QUANTITY"];
             }
         }
+        //обновить цену старого заказа
+        \CSaleOrder::Update($ID, Array("PRICE" => $newFirstOrderPrice));
     }
 
     /**
@@ -312,13 +388,56 @@ class CMultiStore
      * @param $storageId
      * @return bool
      */
-    function getStorageName($storageId)
+    public static function getStorageName($storageId)
     {
-        $rsProps = \CCatalogStore::GetList(array('TITLE' => 'ASC', 'ID' => 'ASC'), array('ACTIVE' => 'Y', "ID" => $storageId,), false, false, Array("TITLE"));
+        $rsProps = \CCatalogStore::GetList(array('TITLE' => 'ASC', 'ID' => 'ASC'), array('ACTIVE' => 'Y', "ID" => intval($storageId)), false, false, Array("TITLE"));
 
         if($arProp = $rsProps->GetNext())
             return $arProp["TITLE"];
         else
             return false;
+    }
+
+    /**
+     * Функция возвращает название склада по его ID
+     * @param       $storageName
+     * @param array $arSelect
+     * @return bool
+     */
+    public static function getStorageByName($storageName, $arSelect = Array())
+    {
+        if(count($arSelect) == 0)
+            $arSelect = Array("*");
+
+        $rsProps = \CCatalogStore::GetList(array('TITLE' => 'ASC', 'ID' => 'ASC'), array('ACTIVE' => 'Y', "TITLE" => $storageName), false, false, $arSelect);
+
+        if($arProp = $rsProps->GetNext())
+            return $arProp;
+        else
+            return false;
+    }
+
+    /**
+     * Метод возвращает массив ИД заказов, которые были разбиты по скаладам от заказа с ИД $orderID
+     *
+     * @param $orderID
+     * @return array
+     */
+    public static function getLinkedOrders($orderID)
+    {
+        $arResult = Array();
+        $db_props = \CSaleOrderPropsValue::GetList(
+            array("SORT" => "ASC"),
+            array(
+                "CODE" => "ORDER_LINK",
+                "VALUE" => $orderID
+            )
+        );
+        while ($arProps = $db_props->Fetch())
+        {
+            $arResult[] = $arProps["ORDER_ID"];
+        }
+
+        return $arResult;
     }
 }
